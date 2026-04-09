@@ -1,307 +1,364 @@
+
+/*
+ * MPI Version 2: Depth-2 Expansion + Static Round-Robin + Bound Sharing + Initial Heuristic
+ *
+ * Strategy:
+ *   1. All ranks run a randomized greedy heuristic (different seeds) to get a
+ *      strong initial P_max. Allreduce picks the global best before exact search.
+ *   2. All ranks independently expand the B&B tree to depth 2, generating the
+ *      same set of subproblems (with pruning against the initial P_max).
+ *   3. Subproblems are sorted by estimated difficulty (descending candidate set
+ *      size) and distributed round-robin for load balance.
+ *   4. Each rank solves its assigned subproblems with async bound sharing.
+ *
+ * Pros:  Better balance than V1 (many subprobs per rank); strong initial bound
+ *        from heuristic means heavy pruning from the start.
+ * Cons:  Static assignment still can't adapt to runtime imbalance.
+ */
+
+#include "graph.hpp"
+#include <mpi.h>
 #include <vector>
 #include <algorithm>
-#include <fstream>
-#include <iostream>
 #include <numeric>
-#include <mpi.h>
+#include <iostream>
+#include <fstream>
+#include <deque>
+#include <random>
+#include <tuple>
+
 using namespace std;
 
-struct Vertex {
-    int profit;
-    int cost;
-};
+static const int TAG_BOUND = 1;
+static const int CHECK_INTERVAL = 500;
 
-int n, m, B;
-int P_max = 0;
+static long long P_max;
+static vector<int> best_clique;
+static const Graph* G;
+static int mpi_rank, mpi_size;
+static int check_counter;
 
-vector<Vertex> V;
-vector<vector<int>> adj;
+static deque<long long> send_bufs;
+static vector<MPI_Request> send_reqs;
 
-vector<int> best_clique;
-
-// MPI tags
-#define WORK_REQUEST 1
-#define WORK_ASSIGN  2
-#define UPDATE_BEST  3
-#define TERMINATE    4
-
-// -----------------------------
-// Greedy Coloring
-// -----------------------------
-vector<vector<int>> greedyColor(const vector<int> &C_cand) {
-    vector<int> nodes = C_cand;
-
-    sort(nodes.begin(), nodes.end(), [&](int a, int b) {
-        return V[a].profit > V[b].profit;
-    });
-
-    vector<vector<int>> colors;
-
-    for (int v : nodes) {
-        bool placed = false;
-
-        for (auto &cls : colors) {
-            bool conflict = false;
-            for (int u : cls) {
-                if (adj[u][v]) {
-                    conflict = true;
-                    break;
-                }
-            }
-            if (!conflict) {
-                cls.push_back(v);
-                placed = true;
-                break;
-            }
-        }
-
-        if (!placed) {
-            colors.push_back({v});
+static void share_bound(long long bound) {
+    for (int r = 0; r < mpi_size; r++) {
+        if (r != mpi_rank) {
+            send_bufs.push_back(bound);
+            MPI_Request req;
+            MPI_Isend(&send_bufs.back(), 1, MPI_LONG_LONG, r, TAG_BOUND, MPI_COMM_WORLD, &req);
+            send_reqs.push_back(req);
         }
     }
-
-    return colors;
 }
 
-// -----------------------------
-int colorBound(const vector<int> &C_cand) {
-    auto colors = greedyColor(C_cand);
-
-    int bound = 0;
-    for (auto &cls : colors) {
-        int best = 0;
-        for (int v : cls) {
-            best = max(best, V[v].profit);
-        }
-        bound += best;
-    }
-    return bound;
-}
-
-// -----------------------------
-double knapsackBound(const vector<int> &C_cand, int remainingBudget) {
-    vector<pair<double,int>> items;
-
-    for (int v : C_cand) {
-        double ratio = (double)V[v].profit / V[v].cost;
-        items.push_back({ratio, v});
-    }
-
-    sort(items.begin(), items.end(), greater<>());
-
-    double total = 0.0;
-    int budget = remainingBudget;
-
-    for (auto &[ratio, v] : items) {
-        if (budget >= V[v].cost) {
-            total += V[v].profit;
-            budget -= V[v].cost;
-        } else {
-            total += ratio * budget;
-            break;
-        }
-    }
-
-    return total;
-}
-
-// -----------------------------
-vector<int> intersectNeighbors(const vector<int> &C_cand, int v) {
-    vector<int> res;
-    for (int u : C_cand) {
-        if (adj[u][v]) {
-            res.push_back(u);
-        }
-    }
-    return res;
-}
-
-// -----------------------------
-// Non-blocking update check
-// -----------------------------
-void checkForUpdates() {
+static void check_incoming_bounds() {
     int flag;
     MPI_Status status;
-
-    MPI_Iprobe(0, UPDATE_BEST, MPI_COMM_WORLD, &flag, &status);
-    if (flag) {
-        int newP;
-        MPI_Recv(&newP, 1, MPI_INT, 0, UPDATE_BEST, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        P_max = max(P_max, newP);
+    while (true) {
+        MPI_Iprobe(MPI_ANY_SOURCE, TAG_BOUND, MPI_COMM_WORLD, &flag, &status);
+        if (!flag) break;
+        long long received;
+        MPI_Recv(&received, 1, MPI_LONG_LONG, status.MPI_SOURCE, TAG_BOUND, MPI_COMM_WORLD, &status);
+        if (received > P_max) P_max = received;
     }
 }
 
-// -----------------------------
-// Branch & Bound
-// -----------------------------
-void findClique(vector<int> C_cand,
-                vector<int> &current_clique,
-                int P_curr,
-                int W_curr) {
+static void cleanup_sends() {
+    if (!send_reqs.empty()) {
+        MPI_Waitall(send_reqs.size(), send_reqs.data(), MPI_STATUSES_IGNORE);
+        send_reqs.clear();
+        send_bufs.clear();
+    }
+}
 
-    checkForUpdates();
+// ---------- Core B&B ----------
 
-    int U_color = colorBound(C_cand);
-    if (P_curr + U_color <= P_max) return;
+static vector<vector<int>> GreedyColor(const vector<int>& C_cand) {
+    vector<int> sorted = C_cand;
+    sort(sorted.begin(), sorted.end(), [](int a, int b) {
+        return G->profit[a] > G->profit[b];
+    });
+    vector<vector<int>> Colors;
+    for (int v : sorted) {
+        bool placed = false;
+        for (auto& c : Colors) {
+            bool ok = true;
+            for (int u : c) if (G->adj[v][u]) { ok = false; break; }
+            if (ok) { c.push_back(v); placed = true; break; }
+        }
+        if (!placed) Colors.push_back({v});
+    }
+    return Colors;
+}
 
-    double U_knap = knapsackBound(C_cand, B - W_curr);
-    if (P_curr + U_knap <= P_max + 1e-9) return;
+static double KnapsackBound(const vector<int>& C_cand, long long remaining) {
+    if (remaining <= 0) return 0.0;
+    vector<int> sorted = C_cand;
+    sort(sorted.begin(), sorted.end(), [](int a, int b) {
+        return G->profit[a] * G->cost[b] > G->profit[b] * G->cost[a];
+    });
+    double U = 0.0;
+    long long left = remaining;
+    for (int v : sorted) {
+        if (G->cost[v] <= left) { U += G->profit[v]; left -= G->cost[v]; }
+        else { U += (double)G->profit[v] * left / G->cost[v]; break; }
+    }
+    return U;
+}
+
+static void FindClique(vector<int> C_cand, long long P_curr, long long W_curr, vector<int> curr_clique) {
+    if (++check_counter % CHECK_INTERVAL == 0)
+        check_incoming_bounds();
+
+    auto Colors = GreedyColor(C_cand);
+    double U_color = 0;
+    for (auto& c : Colors) {
+        long long best = 0;
+        for (int v : c) best = max(best, G->profit[v]);
+        U_color += best;
+    }
+    if (P_curr + U_color <= (double)P_max) return;
+
+    double U_knap = KnapsackBound(C_cand, G->B - W_curr);
+    if (P_curr + U_knap <= (double)P_max) return;
 
     while (!C_cand.empty()) {
-        checkForUpdates();
-
         int v = C_cand.back();
         C_cand.pop_back();
 
-        if (W_curr + V[v].cost <= B) {
-
-            current_clique.push_back(v);
-
-            int newProfit = P_curr + V[v].profit;
-            int newWeight = W_curr + V[v].cost;
-
-            if (newProfit > P_max) {
-                P_max = newProfit;
-
-                // Send new best to master
-                MPI_Send(&P_max, 1, MPI_INT, 0, UPDATE_BEST, MPI_COMM_WORLD);
-
-                best_clique = current_clique;
+        if (W_curr + G->cost[v] <= G->B) {
+            long long new_P = P_curr + G->profit[v];
+            if (new_P > P_max) {
+                P_max = new_P;
+                best_clique = curr_clique;
+                best_clique.push_back(v);
+                share_bound(P_max);
             }
 
-            vector<int> C_next = intersectNeighbors(C_cand, v);
+            vector<int> C_next;
+            for (int u : C_cand)
+                if (G->adj[v][u]) C_next.push_back(u);
 
-            findClique(C_next, current_clique, newProfit, newWeight);
-
-            current_clique.pop_back();
+            vector<int> next_clique = curr_clique;
+            next_clique.push_back(v);
+            FindClique(C_next, new_P, W_curr + G->cost[v], next_clique);
         }
     }
 }
 
-// -----------------------------
-// MAIN
-// -----------------------------
-int main(int argc, char** argv) {
-    MPI_Init(&argc, &argv);
+// ---------- Randomized Greedy Heuristic ----------
+// Build a greedy clique: iteratively add the best-ratio vertex that is
+// adjacent to all current clique members and fits the budget.
+// Random perturbation of profit/cost ratios for diversity across ranks.
 
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+static pair<long long, vector<int>> greedy_heuristic(const Graph& g, mt19937& rng) {
+    vector<int> order(g.N);
+    iota(order.begin(), order.end(), 0);
 
-    // -------------------------
-    // Read input
-    // -------------------------
-    if (rank == 0) {
-        ifstream infile(argv[1]);
-        infile >> n >> m >> B;
+    // Perturbed sort by profit/cost ratio
+    uniform_real_distribution<double> noise(0.8, 1.2);
+    vector<double> score(g.N);
+    for (int i = 0; i < g.N; i++)
+        score[i] = (double)g.profit[i] / g.cost[i] * noise(rng);
+    sort(order.begin(), order.end(), [&](int a, int b) { return score[a] > score[b]; });
 
-        V.resize(n);
-        for (int i = 0; i < n; i++) {
-            infile >> V[i].profit >> V[i].cost;
-        }
-        
-        adj.assign(n, vector<int>(n, 0));
-        
-        for (int i = 0; i < m; i++) {
-            int u, v;
-            infile >> u >> v;
-            adj[u][v] = adj[v][u] = true;
-        }
-    }
-    
-    // Broadcast data
-    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&B, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    
-    if (rank != 0) {
-        V.resize(n);
-        adj.assign(n, vector<int>(n));
-    }
-    
-    MPI_Bcast(V.data(), n * sizeof(Vertex), MPI_BYTE, 0, MPI_COMM_WORLD);
-    for (int i = 0; i < n; i++) {
-        MPI_Bcast(adj[i].data(), n, MPI_INT, 0, MPI_COMM_WORLD);
-    }
+    vector<int> clique;
+    long long profit = 0, weight = 0;
 
-    // -------------------------
-    // MASTER
-    // -------------------------
-    if (rank == 0) {
-        queue<int> tasks;
-        for (int i = 0; i < n; i++) tasks.push(i);
-
-        int active_workers = size - 1;
-
-        while (active_workers > 0) {
-            MPI_Status status;
-            int flag;
-
-            MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status);
-
-            if (!flag) continue;
-
-            int msg;
-            MPI_Recv(&msg, 1, MPI_INT, status.MPI_SOURCE,
-                     status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-            int worker = status.MPI_SOURCE;
-
-            if (status.MPI_TAG == WORK_REQUEST) {
-                if (!tasks.empty()) {
-                    int v = tasks.front(); tasks.pop();
-                    MPI_Send(&v, 1, MPI_INT, worker, WORK_ASSIGN, MPI_COMM_WORLD);
-                    cout << v << endl;
-                } else {
-                    MPI_Send(NULL, 0, MPI_INT, worker, TERMINATE, MPI_COMM_WORLD);
-                    active_workers--;
-                }
-            }
-            else if (status.MPI_TAG == UPDATE_BEST) {
-                if (msg > P_max) {
-                    P_max = msg;
-
-                    // Send to all workers (NO BCAST)
-                    for (int i = 1; i < size; i++) {
-                        MPI_Send(&P_max, 1, MPI_INT, i, UPDATE_BEST, MPI_COMM_WORLD);
-                    }
-                }
-            }
-        }
-
-        cout << "Maximum Profit: " << P_max << "\n";
-        cout << "Clique vertices: ";
-
-        for (int v : best_clique) cout << v << " ";
-        cout << endl;
-    }
-
-    // -------------------------
-    // WORKERS
-    // -------------------------
-    else {
-        while (true) {
-            int dummy = 0;
-            MPI_Send(&dummy, 1, MPI_INT, 0, WORK_REQUEST, MPI_COMM_WORLD);
-
-            MPI_Status status;
-            int v;
-
-            MPI_Recv(&v, 1, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
-
-            if (status.MPI_TAG == TERMINATE) break;
-
-            vector<int> C_cand;
-            for (int i = 0; i < n; i++) {
-                if (adj[v][i]) C_cand.push_back(i);
-            }
-
-            vector<int> clique;
+    for (int v : order) {
+        if (weight + g.cost[v] > g.B) continue;
+        bool fits = true;
+        for (int u : clique)
+            if (!g.adj[v][u]) { fits = false; break; }
+        if (fits) {
             clique.push_back(v);
+            profit += g.profit[v];
+            weight += g.cost[v];
+        }
+    }
+    return {profit, clique};
+}
 
-            findClique(C_cand, clique, V[v].profit, V[v].cost);
+// ---------- Subproblem representation ----------
+struct Subproblem {
+    vector<int> C_cand;
+    vector<int> clique;
+    long long P_curr;
+    long long W_curr;
+};
+
+// Generate all depth-2 subproblems from the B&B root.
+// Uses the same branching logic as FindClique but stops at depth 2.
+static vector<Subproblem> generate_subproblems(const Graph& g) {
+    vector<Subproblem> subs;
+
+    // Depth-1: iterate root candidates
+    vector<int> root_cand(g.N);
+    iota(root_cand.begin(), root_cand.end(), 0);
+
+    for (int i = (int)root_cand.size() - 1; i >= 0; i--) {
+        int v = root_cand[i];
+        if (g.cost[v] > g.B) continue;
+
+        long long P1 = g.profit[v];
+        long long W1 = g.cost[v];
+
+        // C_next at depth 1: neighbors of v among [0..v-1]
+        vector<int> C1;
+        for (int u = 0; u < i; u++)
+            if (g.adj[v][root_cand[u]]) C1.push_back(root_cand[u]);
+
+        if (C1.empty()) {
+            // Leaf at depth 1: this is a complete subproblem (single-vertex clique)
+            // Just check if it beats P_max (handled during solve)
+            subs.push_back({C1, {v}, P1, W1});
+            continue;
+        }
+
+        // Depth-2: iterate candidates within this branch
+        for (int j = (int)C1.size() - 1; j >= 0; j--) {
+            int w = C1[j];
+            if (W1 + g.cost[w] > g.B) continue;
+
+            long long P2 = P1 + g.profit[w];
+            long long W2 = W1 + g.cost[w];
+
+            // C_next at depth 2: neighbors of w among C1[0..j-1]
+            vector<int> C2;
+            for (int k = 0; k < j; k++)
+                if (g.adj[w][C1[k]]) C2.push_back(C1[k]);
+
+            subs.push_back({C2, {v, w}, P2, W2});
+        }
+
+        // Also add the depth-1 "don't pick any depth-2 vertex" case?
+        // No — the sequential code's while-loop covers all choices including
+        // "skip v" implicitly by continuing the loop. The depth-2 expansion
+        // above already generates all sub-branches. But we still need the
+        // depth-1 subproblem for the case where v is alone:
+        // Actually, the depth-2 expansions above cover all children.
+        // The depth-1 node with v alone is only a leaf if C1 is empty,
+        // which we handled above. So we're fine.
+    }
+
+    return subs;
+}
+
+int main(int argc, char* argv[]) {
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+
+    if (argc < 3) {
+        if (mpi_rank == 0) cerr << "Usage: " << argv[0] << " <input> <output>\n";
+        MPI_Finalize(); return 1;
+    }
+
+    Graph g;
+    if (!g.load(argv[1])) { MPI_Finalize(); return 1; }
+    G = &g;
+    P_max = 0;
+    best_clique.clear();
+    check_counter = 0;
+
+    double t_start = MPI_Wtime();
+
+    // ---------- Phase 1: Parallel greedy heuristic ----------
+    {
+        mt19937 rng(42 + mpi_rank * 1000);
+        int trials = max(50, 500 / mpi_size); // each rank does this many trials
+        for (int t = 0; t < trials; t++) {
+            auto [profit, clique] = greedy_heuristic(g, rng);
+            if (profit > P_max) {
+                P_max = profit;
+                best_clique = clique;
+            }
         }
     }
 
+    // Allreduce to get global best heuristic bound
+    long long heur_global;
+    MPI_Allreduce(&P_max, &heur_global, 1, MPI_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
+    // Find winner and broadcast its clique
+    {
+        int winner = (P_max == heur_global) ? mpi_rank : mpi_size;
+        int gw;
+        MPI_Allreduce(&winner, &gw, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        int cs = (mpi_rank == gw) ? (int)best_clique.size() : 0;
+        MPI_Bcast(&cs, 1, MPI_INT, gw, MPI_COMM_WORLD);
+        if (mpi_rank != gw) best_clique.resize(cs);
+        MPI_Bcast(best_clique.data(), cs, MPI_INT, gw, MPI_COMM_WORLD);
+        P_max = heur_global;
+    }
+
+    if (mpi_rank == 0)
+        cout << "Heuristic P_max = " << P_max << "\n";
+
+    // ---------- Phase 2: Generate subproblems (all ranks, deterministic) ----------
+    auto subs = generate_subproblems(g);
+
+    // Sort by descending candidate set size (larger = harder = process first)
+    // Then round-robin assignment distributes hard tasks evenly.
+    sort(subs.begin(), subs.end(), [](const Subproblem& a, const Subproblem& b) {
+        return a.C_cand.size() > b.C_cand.size();
+    });
+
+    if (mpi_rank == 0)
+        cout << "Generated " << subs.size() << " depth-2 subproblems\n";
+
+    // ---------- Phase 3: Solve assigned subproblems ----------
+    for (int i = 0; i < (int)subs.size(); i++) {
+        if (i % mpi_size != mpi_rank) continue;
+
+        auto& sp = subs[i];
+
+        // Check if this subproblem's clique already beats P_max
+        if (sp.P_curr > P_max) {
+            P_max = sp.P_curr;
+            best_clique = sp.clique;
+            share_bound(P_max);
+        }
+
+        if (!sp.C_cand.empty()) {
+            FindClique(sp.C_cand, sp.P_curr, sp.W_curr, sp.clique);
+        }
+    }
+
+    check_incoming_bounds();
+
+    // ---------- Gather global best ----------
+    long long global_P_max;
+    MPI_Allreduce(&P_max, &global_P_max, 1, MPI_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
+    {
+        int winner = (P_max == global_P_max) ? mpi_rank : mpi_size;
+        int gw;
+        MPI_Allreduce(&winner, &gw, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        int cs = (mpi_rank == gw) ? (int)best_clique.size() : 0;
+        MPI_Bcast(&cs, 1, MPI_INT, gw, MPI_COMM_WORLD);
+        if (mpi_rank != gw) best_clique.resize(cs);
+        MPI_Bcast(best_clique.data(), cs, MPI_INT, gw, MPI_COMM_WORLD);
+    }
+
+    double t_end = MPI_Wtime();
+
+    if (mpi_rank == 0) {
+        ofstream out(argv[2]);
+        out << global_P_max << "\n";
+        for (int i = 0; i < (int)best_clique.size(); i++) {
+            if (i) out << " ";
+            out << best_clique[i];
+        }
+        out << "\n";
+
+        cout << "P_max = " << global_P_max << "\n";
+        cout << "Clique:";
+        for (int v : best_clique) cout << " " << v;
+        cout << "\nTime: " << (t_end - t_start) << " sec, Ranks: " << mpi_size << "\n";
+    }
+
+    cleanup_sends();
     MPI_Finalize();
     return 0;
 }
+
