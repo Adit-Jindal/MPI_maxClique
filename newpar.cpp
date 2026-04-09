@@ -1,4 +1,8 @@
-#include <bits/stdc++.h>
+#include <vector>
+#include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <numeric>
 #include <mpi.h>
 using namespace std;
 
@@ -11,7 +15,7 @@ int n, m, B;
 int P_max = 0;
 
 vector<Vertex> V;
-vector<vector<bool>> adj;
+vector<vector<int>> adj;
 
 vector<int> best_clique;
 
@@ -195,28 +199,28 @@ int main(int argc, char** argv) {
         for (int i = 0; i < n; i++) {
             infile >> V[i].profit >> V[i].cost;
         }
-
-        adj.assign(n, vector<bool>(n, false));
-
+        
+        adj.assign(n, vector<int>(n, 0));
+        
         for (int i = 0; i < m; i++) {
             int u, v;
             infile >> u >> v;
             adj[u][v] = adj[v][u] = true;
         }
     }
-
+    
     // Broadcast data
     MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&B, 1, MPI_INT, 0, MPI_COMM_WORLD);
-
+    
     if (rank != 0) {
         V.resize(n);
-        adj.assign(n, vector<bool>(n));
+        adj.assign(n, vector<int>(n));
     }
-
+    
     MPI_Bcast(V.data(), n * sizeof(Vertex), MPI_BYTE, 0, MPI_COMM_WORLD);
     for (int i = 0; i < n; i++) {
-        MPI_Bcast(adj[i].data(), n, MPI_C_BOOL, 0, MPI_COMM_WORLD);
+        MPI_Bcast(adj[i].data(), n, MPI_INT, 0, MPI_COMM_WORLD);
     }
 
     // -------------------------
@@ -246,6 +250,7 @@ int main(int argc, char** argv) {
                 if (!tasks.empty()) {
                     int v = tasks.front(); tasks.pop();
                     MPI_Send(&v, 1, MPI_INT, worker, WORK_ASSIGN, MPI_COMM_WORLD);
+                    cout << v << endl;
                 } else {
                     MPI_Send(NULL, 0, MPI_INT, worker, TERMINATE, MPI_COMM_WORLD);
                     active_workers--;
