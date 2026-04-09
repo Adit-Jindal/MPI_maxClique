@@ -16,7 +16,6 @@
  * Cons:  Static assignment still can't adapt to runtime imbalance.
  */
 
-#include "graph.hpp"
 #include <mpi.h>
 #include <vector>
 #include <algorithm>
@@ -28,6 +27,46 @@
 #include <tuple>
 
 using namespace std;
+
+struct Graph {
+    int N; // number of vertices
+    int M; // number of edges
+    long long B; // budget
+
+    vector<long long> profit;
+    vector<long long> cost;
+    vector<vector<bool>> adj;
+
+    bool load(const char* filename) {
+        ifstream infile(filename);
+        if (!infile) {
+            cerr << "Error opening file\n";
+            return false;
+        }
+
+        infile >> N >> M >> B;
+
+        profit.resize(N);
+        cost.resize(N);
+        adj.assign(N, vector<bool>(N, false));
+
+        // read vertex data
+        for (int i = 0; i < N; i++) {
+            infile >> profit[i] >> cost[i];
+        }
+
+        // read edges
+        for (int i = 0; i < M; i++) {
+            int u, v;
+            infile >> u >> v;
+            adj[u][v] = true;
+            adj[v][u] = true;
+        }
+
+        return true;
+    }
+};
+
 
 static const int TAG_BOUND = 1;
 static const int CHECK_INTERVAL = 500;
@@ -110,7 +149,7 @@ static double KnapsackBound(const vector<int>& C_cand, long long remaining) {
 static void FindClique(vector<int> C_cand, long long P_curr, long long W_curr, vector<int> curr_clique) {
     if (++check_counter % CHECK_INTERVAL == 0)
         check_incoming_bounds();
-
+        
     auto Colors = GreedyColor(C_cand);
     double U_color = 0;
     for (auto& c : Colors) {

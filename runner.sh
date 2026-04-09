@@ -1,6 +1,6 @@
 #!/bin/bash
 
-EXEC=./a.out
+EXEC=./main
 INPUT=input.txt
 OUTPUT=out.txt
 SEQ_TIME=120.0
