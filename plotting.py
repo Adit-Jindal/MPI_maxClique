@@ -1,20 +1,19 @@
 import matplotlib.pyplot as plt
 
-# hardcoded sequential time
-SEQ_TIME = 120.0  # <-- change this
-
 procs = []
 times = []
+speedups = []
 
 with open("results.txt") as f:
     for line in f:
         if line.startswith("#"): continue
-        p, t = line.split()
+        p, t, s = line.split()
         procs.append(int(p))
         times.append(float(t))
+        speedups.append(float(s))
 
 # compute speedup
-speedup = [SEQ_TIME / t for t in times]
+speedup = [speedups[0] / t for t in times]
 
 # ---- Plot 1: Time vs Processes ----
 plt.figure()
